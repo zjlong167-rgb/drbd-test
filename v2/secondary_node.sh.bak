@@ -67,14 +67,13 @@ section() {
 }
 
 PROTOCOL="${1:-A}"
-# 第二个参数：要验证的服务，逗号分隔，默认 all
-_svc_arg="${2:-all}"
-case "$_svc_arg" in
-    all|"mysql,nsq"|"nsq,mysql") TEST_MYSQL=1; TEST_NSQ=1 ;;
-    mysql)  TEST_MYSQL=1; TEST_NSQ=0 ;;
-    nsq)    TEST_MYSQL=0; TEST_NSQ=1 ;;
-    *)      TEST_MYSQL=1; TEST_NSQ=1 ;;
-esac
+# 第二个参数：要验证的服务列表，逗号分隔（mysql,redis,nsq）
+SERVICES="${2:-mysql,redis,nsq}"
+
+service_enabled() {
+    echo "${SERVICES}" | tr ',' '\n' | grep -xq "$1"
+}
+
 
 # =============================================================================
 # 工具函数
@@ -109,12 +108,11 @@ mkdir -p "$RESULT_DIR"
 
 section "备节点接管实验开始 (Protocol ${PROTOCOL})"
 
+log "待验证服务: ${BOLD}${SERVICES}${NC}"
+
+
 log "备节点 IP: 192.168.171.131"
 log "主节点 IP: ${PRIMARY_IP}"
-_svc_display=""
-[ "$TEST_MYSQL" -eq 1 ] && _svc_display="${_svc_display}mysql " || true
-[ "$TEST_NSQ"   -eq 1 ] && _svc_display="${_svc_display}nsq"    || true
-log "验证服务 : ${_svc_display:-（未指定）}"
 
 # =============================================================================
 # 步骤1：DRBD 状态检查
@@ -193,49 +191,35 @@ fi
 
 section "步骤3：挂载 DRBD 文件系统"
 
+# 使用已知设备路径和挂载目录
 info "DRBD 设备: ${DRBD_DEV}"
 
 # 检测文件系统类型
 FS_TYPE=$(blkid -o value -s TYPE "${DRBD_DEV}" 2>/dev/null || echo "ext4")
 info "文件系统类型: ${FS_TYPE}"
 
+# 尝试挂载
 mkdir -p "${MOUNT_POINT}"
 
-# ── 彻底清理挂载状态 ────────────────────────────────────────────────────
-# 问题场景：
-#   a) /database 已被挂载（上次实验未清理）
-#   b) drbd1 设备被挂载在其他路径
-#   c) /proc/mounts 记录了挂载但 mountpoint -q 未检测到（EEXIST）
-# 解决：先检查 /proc/mounts 里所有 drbd1 的挂载，全部 umount
-info "清理 ${DRBD_DEV} 残留挂载..."
-(grep -w "${DRBD_DEV}" /proc/mounts || true) | awk '{print $2}' | while read -r _mnt; do
-    info "发现残留挂载: ${_mnt}，执行 umount..."
-    umount "${_mnt}" 2>/dev/null || umount -l "${_mnt}" 2>/dev/null || true
-done
-# 再检查挂载点本身
 if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
-    info "${MOUNT_POINT} 仍被挂载，执行 umount..."
-    umount "${MOUNT_POINT}" 2>/dev/null || umount -l "${MOUNT_POINT}" 2>/dev/null || true
+    info "已有挂载点，先卸载..."
+    umount "${MOUNT_POINT}" 2>/dev/null || umount -l "${MOUNT_POINT}"
 fi
-sleep 1
-# ────────────────────────────────────────────────────────────────────────
 
 if ! mount "${DRBD_DEV}" "${MOUNT_POINT}" 2>/dev/null; then
     warn "挂载失败，尝试 fsck 修复..."
     fsck -y "${DRBD_DEV}" 2>&1 | tee -a "$LOG" || true
-    if ! mount "${DRBD_DEV}" "${MOUNT_POINT}" 2>&1 | tee -a "$LOG"; then
+    mount "${DRBD_DEV}" "${MOUNT_POINT}" 2>&1 | tee -a "$LOG" || {
         err "文件系统挂载失败！"
-        info "── 内核日志 ──"
         dmesg | tail -20 | tee -a "$LOG"
-        info "── /proc/mounts 中 drbd 相关 ──"
-        grep drbd /proc/mounts 2>/dev/null | tee -a "$LOG" || echo "(无)"
         exit 1
-    fi
+    }
 fi
 
 ok "文件系统挂载成功: ${DRBD_DEV} → ${MOUNT_POINT}"
 df -h "${MOUNT_POINT}" | tee -a "$LOG"
 
+# 检测关键目录是否存在
 info "DRBD 挂载点目录内容："
 ls -la "${MOUNT_POINT}/" | tee -a "$LOG"
 
@@ -243,18 +227,15 @@ ls -la "${MOUNT_POINT}/" | tee -a "$LOG"
 # 步骤4：MySQL 文件完整性检查（启动前）
 # =============================================================================
 
-section "步骤4：MySQL 文件完整性检查"
+if service_enabled mysql; then
 
-if [ "$TEST_MYSQL" -eq 0 ]; then
-    info "（跳过 MySQL，--services 未包含 mysql）"
-    MYSQL_DATADIR="/database/mysql/data"
-    STARTED=0
-    echo "MYSQL_SKIPPED" > "${RESULT_DIR}/mysql_start_result.txt"
-else
+
+section "步骤4：MySQL 文件完整性检查"
 
 # 使用已知的 MySQL datadir 路径
 MYSQL_DATADIR="/database/mysql/data"
 if [ ! -d "$MYSQL_DATADIR" ]; then
+    # 兜底：尝试从配置文件读取
     MYSQL_DATADIR=$(grep -r "^datadir" /etc/my.cnf /etc/my.cnf.d/ /etc/mysql/ \
                         2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')
     MYSQL_DATADIR="${MYSQL_DATADIR:-/var/lib/mysql}"
@@ -266,6 +247,7 @@ ls -la "${MYSQL_DATADIR}"/*.ibd 2>/dev/null | head -5 | tee -a "$LOG" || true
 ls -la "${MYSQL_DATADIR}"/ibdata* 2>/dev/null | tee -a "$LOG" || true
 
 info "--- Redo Log 文件 ---"
+# MySQL 5.7/8.0 redo log 位置不同
 ls -la "${MYSQL_DATADIR}"/ib_logfile* 2>/dev/null | tee -a "$LOG" || \
 ls -la "${MYSQL_DATADIR}"/'#innodb_redo'/ 2>/dev/null | tee -a "$LOG" || \
     warn "未找到 redo log 文件"
@@ -279,6 +261,7 @@ info "--- 测试表 ibd 文件 ---"
 ls -la "${MYSQL_DATADIR}"/drbd_test/ 2>/dev/null | tee -a "$LOG" || \
     warn "drbd_test 数据库目录不存在"
 
+# 检查文件是否有截断（大小为 0 或异常）
 ZERO_FILES=$(find "${MYSQL_DATADIR}" -name "*.ibd" -size 0 2>/dev/null | wc -l)
 if [ "$ZERO_FILES" -gt 0 ]; then
     warn "发现 ${ZERO_FILES} 个大小为 0 的 .ibd 文件（可能损坏）："
@@ -287,23 +270,30 @@ else
     ok "未发现大小为 0 的 .ibd 文件"
 fi
 
+# 记录文件状态快照
 find "${MYSQL_DATADIR}" \( -name "*.ibd" -o -name "ib_logfile*" \
      -o -name "ibdata*" \) 2>/dev/null | \
      xargs -I{} stat {} 2>/dev/null \
      > "${RESULT_DIR}/mysql_files_before_start.txt" || true
 
-fi # TEST_MYSQL
+fi
+
+# Redis 文件完整性检查（如果启用）
+if service_enabled redis; then
+    section "步骤4.5：Redis 文件完整性检查"
+    # 默认数据目录，尝试从 redis.conf 读取
+    REDIS_DIR="/var/lib/redis"
+    [ -f /etc/redis/redis.conf ] && REDIS_DIR=$(grep -E '^dir ' /etc/redis/redis.conf | awk '{print $2}')
+    info "Redis 数据目录: ${REDIS_DIR}"
+    ls -la "${REDIS_DIR}"/dump.rdb 2>/dev/null | tee -a "$LOG" || true
+    ls -la "${REDIS_DIR}"/appendonly.aof 2>/dev/null | tee -a "$LOG" || true
+fi
 
 # =============================================================================
 # 步骤5：启动 MySQL 并分析 Crash Recovery
 # =============================================================================
 
 section "步骤5：启动 MySQL（观察 Crash Recovery）"
-
-if [ "$TEST_MYSQL" -eq 0 ]; then
-    info "（跳过 MySQL 启动，--services 未包含 mysql）"
-    STARTED=0
-else
 
 # 确保 MySQL 停止
 if [ -n "$MYSQL_SERVICE" ]; then
@@ -413,6 +403,21 @@ else
     echo "MYSQL_START_SUCCESS" > "${RESULT_DIR}/mysql_start_result.txt"
 fi
 
+# Redis 启动（如果启用）
+if service_enabled redis; then
+    section "Redis 启动验证"
+    info "尝试启动 Redis 服务..."
+    systemctl start redis-server 2>/dev/null || true
+    sleep 2
+    if systemctl is-active redis-server --quiet; then
+        ok "Redis 运行中"
+        echo "REDIS_START_SUCCESS" > "${RESULT_DIR}/redis_start_result.txt"
+    else
+        fail "Redis 未能启动"
+        echo "REDIS_START_FAILED" > "${RESULT_DIR}/redis_start_result.txt"
+    fi
+fi
+
 # 提取 Crash Recovery 关键日志
 section "MySQL Crash Recovery 分析"
 
@@ -435,6 +440,9 @@ fi || true
 
 section "步骤6：MySQL 数据一致性验证"
 
+if service_enabled mysql; then
+
+
 if [ $STARTED -eq 1 ]; then
     info "查询备节点恢复后的数据..."
     mysql_cmd drbd_test -e \
@@ -445,7 +453,11 @@ if [ $STARTED -eq 1 ]; then
     cat "${RESULT_DIR}/mysql_secondary_data.txt" | tee -a "$LOG"
 
     # 行数对比
-    PRIMARY_ROWS=$(wc -l < /tmp/primary_mysql_rows.txt 2>/dev/null || echo "?")
+    if [ -f /tmp/primary_mysql_rows.txt ]; then
+        PRIMARY_ROWS=$(wc -l < /tmp/primary_mysql_rows.txt)
+    else
+        PRIMARY_ROWS="?"
+    fi
     SECONDARY_ROWS=$(wc -l < "${RESULT_DIR}/mysql_secondary_data.txt")
     info "行数统计 - 备节点: ${SECONDARY_ROWS} 行"
 
@@ -464,29 +476,39 @@ if [ $STARTED -eq 1 ]; then
     mysql_cmd -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null | \
         grep "Log sequence number" | tee -a "$LOG" || true
 
+    fi  # service_enabled mysql
+
+# Redis 数据验证
+if service_enabled redis; then
+    info "查询 Redis 写入的键..."
+    if [ -f "${RESULT_DIR}/redis_key_written.txt" ]; then
+        REDIS_KEY=$(cat "${RESULT_DIR}/redis_key_written.txt")
+        REDIS_VAL=$(redis-cli get "$REDIS_KEY" 2>/dev/null || true)
+        echo "redis_key=${REDIS_KEY} value=${REDIS_VAL}" > "${RESULT_DIR}/redis_secondary_data.txt"
+        info "备节点 Redis 数据: $REDIS_VAL"
+    else
+        warn "未找到主节点写入的 Redis 键记录"
+    fi
+fi
+
 else
     fail "MySQL 未能启动，跳过数据验证"
     echo "无法获取数据（MySQL 启动失败）" \
          > "${RESULT_DIR}/mysql_secondary_data.txt"
 fi
 
-fi # TEST_MYSQL (步骤5/6)
-
 # =============================================================================
 # 步骤7：NSQ 文件完整性检查（启动前）
 # =============================================================================
 
-section "步骤7：NSQ diskqueue 文件完整性检查"
+if service_enabled nsq; then
 
-if [ "$TEST_NSQ" -eq 0 ]; then
-    info "（跳过 NSQ，--services 未包含 nsq）"
-    NSQ_DATA_DIR="${NSQ_DATA_DIR_DEFAULT}"
-    NSQ_STARTED=0
-    echo "NSQ_SKIPPED" > "${RESULT_DIR}/nsq_start_result.txt"
-else
+
+section "步骤7：NSQ diskqueue 文件完整性检查"
 
 # 直接使用已知的 NSQ 数据目录路径
 NSQ_DATA_DIR="${NSQ_DATA_DIR_DEFAULT}"
+# 如果不存在则尝试挂载点下的路径
 if [ ! -d "$NSQ_DATA_DIR" ]; then
     NSQ_DATA_DIR="${MOUNT_POINT}/nsq/data/nsqd"
 fi
@@ -577,9 +599,14 @@ for dat in data_files:
         print(f"  ！未找到对应 meta.dat 文件")
 PYEOF
 
+fi  # service_enabled nsq
+
 # =============================================================================
-# 步骤8：启动 NSQ 并验证
+# 步骤8：启动 NSQ 并验证消息
 # =============================================================================
+
+if service_enabled nsq; then
+
 
 section "步骤8：启动 NSQ 并验证消息"
 
@@ -649,6 +676,7 @@ except Exception as e:
         fi
     else
         warn "nsq_tail 未找到，跳过消费验证"
+        # 通过 HTTP 检查
         DEPTH=$(curl -s "${NSQ_HTTP}/stats?format=json" 2>/dev/null | \
                 python3 -c "
 import json,sys
@@ -665,7 +693,9 @@ print(total)" 2>/dev/null || echo "0")
     fi
 fi
 
-fi # TEST_NSQ (步骤7/8)
+# =============================================================================
+# 步骤9：汇总分析报告
+# =============================================================================
 
 # =============================================================================
 # 步骤9：汇总分析报告
@@ -676,42 +706,94 @@ section "步骤9：最终数据一致性汇总报告"
 # 读取各项结果
 MYSQL_RESULT=$(cat "${RESULT_DIR}/mysql_start_result.txt" 2>/dev/null || echo "UNKNOWN")
 NSQ_RESULT=$(cat "${RESULT_DIR}/nsq_start_result.txt" 2>/dev/null || echo "UNKNOWN")
+REDIS_RESULT="UNKNOWN"
+if service_enabled redis; then
+    if systemctl is-active redis-server --quiet; then
+        REDIS_RESULT="REDIS_STARTED"
+    else
+        REDIS_RESULT="REDIS_FAILED"
+    fi
+fi
+
 SEC_ROWS=$(wc -l < "${RESULT_DIR}/mysql_secondary_data.txt" 2>/dev/null | tr -d ' ' || echo "0")
 [ -z "$SEC_ROWS" ] && SEC_ROWS=0
 NSQ_DEPTH=$(cat "${RESULT_DIR}/nsq_stats_secondary.txt" 2>/dev/null | \
     grep -o 'depth *= *[0-9]*' | grep -o '[0-9]*' | head -1 || echo "?")
 
-# ── 服务启动结论（区分跳过/成功/失败）────────────────────────────────
-if [ "$TEST_MYSQL" -eq 0 ]; then
-    SVC_MYSQL="─ 未测试（--services 未包含 mysql）"
-    DATA_MYSQL="─ 未测试"
-elif [ "$MYSQL_RESULT" = "MYSQL_START_SUCCESS" ]; then
-    SVC_MYSQL="✓ 正常启动"
-    if [ "$SEC_ROWS" -gt 0 ]; then
-        DATA_MYSQL="✓ 有数据（${SEC_ROWS} 行）"
+# ── 服务启动结论 ──────────────────────────────────────────────────────
+if service_enabled mysql; then
+    if [ "$MYSQL_RESULT" = "MYSQL_START_SUCCESS" ]; then
+        SVC_MYSQL="✓ 正常启动"
     else
-        DATA_MYSQL="✗ 数据为空（事务已回滚）"
+        SVC_MYSQL="✗ 启动失败（查看上方 MySQL 日志）"
     fi
 else
-    SVC_MYSQL="✗ 启动失败（查看上方 MySQL 日志）"
-    DATA_MYSQL="? 无法验证（MySQL 未启动）"
+    SVC_MYSQL="（跳过）"
 fi
 
-if [ "$TEST_NSQ" -eq 0 ]; then
-    SVC_NSQ="─ 未测试（--services 未包含 nsq）"
-    DATA_NSQ="─ 未测试"
-elif [ "$NSQ_RESULT" = "NSQ_START_SUCCESS" ]; then
-    SVC_NSQ="✓ 正常启动"
-    if [ -s "${RESULT_DIR}/nsq_consumed.txt" ]; then
-        DATA_NSQ="✓ 消息可消费"
-    elif [ "${NSQ_DEPTH:-0}" -gt 0 ] 2>/dev/null; then
-        DATA_NSQ="✓ 队列有消息（depth=${NSQ_DEPTH}）"
+# Redis 服务状态
+if service_enabled redis; then
+    if [ "$REDIS_RESULT" = "REDIS_STARTED" ]; then
+        SVC_REDIS="✓ 正常启动"
     else
-        DATA_NSQ="✗ 队列为空（消息丢失 或 meta/data 不一致）"
+        SVC_REDIS="✗ 启动失败"
     fi
 else
-    SVC_NSQ="✗ 启动失败"
-    DATA_NSQ="? 无法验证（NSQ 未启动）"
+    SVC_REDIS="（跳过）"
+fi
+
+if service_enabled nsq; then
+    if [ "$NSQ_RESULT" = "NSQ_START_SUCCESS" ]; then
+        SVC_NSQ="✓ 正常启动"
+    else
+        SVC_NSQ="✗ 启动失败"
+    fi
+else
+    SVC_NSQ="（跳过）"
+fi
+
+# ── 数据一致性结论 ───────────────────────────────────────────────────
+# MySQL：有无数据
+if service_enabled mysql; then
+    if [ "$MYSQL_RESULT" = "MYSQL_START_SUCCESS" ]; then
+        if [ "$SEC_ROWS" -gt 0 ]; then
+            DATA_MYSQL="✓ 有数据（${SEC_ROWS} 行）"
+        else
+            DATA_MYSQL="✗ 数据为空（事务已回滚）"
+        fi
+    else
+        DATA_MYSQL="? 无法验证（MySQL 未启动）"
+    fi
+else
+    DATA_MYSQL="（跳过）"
+fi
+
+# Redis：键是否存在
+if service_enabled redis; then
+    if [ -s "${RESULT_DIR}/redis_secondary_data.txt" ]; then
+        DATA_REDIS="✓ 键存在: $(cat ${RESULT_DIR}/redis_secondary_data.txt)"
+    else
+        DATA_REDIS="✗ 键不存在或Redis未启动"
+    fi
+else
+    DATA_REDIS="（跳过）"
+fi
+
+# NSQ：队列深度 / 可消费
+if service_enabled nsq; then
+    if [ "$NSQ_RESULT" = "NSQ_START_SUCCESS" ]; then
+        if [ -s "${RESULT_DIR}/nsq_consumed.txt" ]; then
+            DATA_NSQ="✓ 消息可消费"
+        elif [ "${NSQ_DEPTH:-0}" -gt 0 ] 2>/dev/null; then
+            DATA_NSQ="✓ 队列有消息（depth=${NSQ_DEPTH}）"
+        else
+            DATA_NSQ="✗ 队列为空（消息丢失 或 meta/data 不一致）"
+        fi
+    else
+        DATA_NSQ="? 无法验证（NSQ 未启动）"
+    fi
+else
+    DATA_NSQ="（跳过）"
 fi
 
 {
@@ -772,11 +854,9 @@ fi
 section "步骤10：恢复环境"
 
 info "停止备节点服务..."
-[ "$TEST_MYSQL" -eq 1 ] && {
-    systemctl stop "${MYSQL_SERVICE:-mysqld}" 2>/dev/null || \
-        pkill -f "$MYSQL_BIN" 2>/dev/null || true
-}
-[ "$TEST_NSQ" -eq 1 ] && systemctl stop nsqd 2>/dev/null || true
+systemctl stop "${MYSQL_SERVICE:-mysqld}" 2>/dev/null || \
+    pkill -f "$MYSQL_BIN" 2>/dev/null || true
+systemctl stop nsqd   2>/dev/null || true
 sleep 1
 
 info "卸载 DRBD 文件系统..."
@@ -802,3 +882,4 @@ info "✓ 备节点结果已打包到 /tmp/secondary_results.tar.gz"
 
 echo ""
 echo "SECONDARY_DONE"
+exit 0

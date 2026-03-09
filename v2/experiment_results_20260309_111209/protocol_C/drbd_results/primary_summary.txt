@@ -1,0 +1,51 @@
+===== DRBD 主节点实验结果 =====
+Protocol : C
+Services : mysql 
+时间     : Mon 09 Mar 2026 10:55:04 AM CST
+
+--- MySQL 事务前后数据对比 ---
+[事务前]
+0	0
+[事务后（主节点已提交）]
+1	ROW_A_drbd_partial_io_test_data_payload_aaaaaaaaaaaaaaaaaaaaaaaaaaaa_UPDATED	2026-03-09 10:54:55.982166
+2	ROW_B_drbd_partial_io_test_data_payload_bbbbbbbbbbbbbbbbbbbbbbbbbbbb_UPDATED	2026-03-09 10:54:55.982166
+3	ROW_C_drbd_partial_io_test_data_payload_cccccccccccccccccccccccccccc_UPDATED	2026-03-09 10:54:55.982166
+[LSN 变化] before=21517971 after=21520860
+[Binlog 位置]
+
+--- DRBD IO 拦截统计 ---
+[interceptor] 启动成功，最多允许 2 个数据帧通过
+[interceptor] PASS frame=1 tcp_data=32B
+[interceptor] PASS frame=2 tcp_data=32B
+[interceptor] *** 已通过 2 帧，切换 DROP 模式 ***
+[interceptor] DROP frame=2 drop=1 size=52
+[interceptor] DROP frame=2 drop=2 size=52
+[interceptor] DROP frame=2 drop=3 size=52
+[interceptor] DROP frame=2 drop=4 size=64
+[interceptor] DROP frame=2 drop=5 size=52
+[interceptor] DROP frame=2 drop=6 size=52
+[interceptor] DROP frame=2 drop=7 size=52
+[interceptor] DROP frame=2 drop=8 size=52
+[interceptor] DROP frame=2 drop=9 size=52
+[interceptor] DROP frame=2 drop=10 size=52
+[interceptor] DROP frame=2 drop=11 size=52
+[interceptor] DROP frame=2 drop=12 size=84
+[interceptor] DROP frame=2 drop=13 size=64
+[interceptor] DROP frame=2 drop=14 size=84
+[interceptor] DROP frame=2 drop=15 size=84
+[interceptor] DROP frame=2 drop=16 size=64
+[interceptor] DROP frame=2 drop=17 size=84
+[interceptor] DROP frame=2 drop=18 size=64
+[interceptor] DROP frame=2 drop=19 size=84
+[interceptor] DROP frame=2 drop=20 size=64
+[interceptor] DROP frame=2 drop=21 size=84
+[interceptor] DROP frame=2 drop=22 size=64
+[interceptor] DROP frame=2 drop=23 size=84
+[interceptor] 清理完成 passed=2 dropped=23
+
+--- 故障后 DRBD 状态 ---
+r0 role:Primary
+  disk:UpToDate open:yes
+  node2 role:Secondary
+    peer-disk:UpToDate
+

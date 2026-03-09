@@ -52,6 +52,8 @@ log()  { echo -e "${CYAN}[$(date '+%H:%M:%S.%3N')]${NC} $*" | tee -a "$LOG"; }
 info() { echo -e "${GREEN}[INFO]${NC} $*" | tee -a "$LOG"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*" | tee -a "$LOG"; }
 err()  { echo -e "${RED}[ERR ]${NC} $*" | tee -a "$LOG"; }
+ok()   { echo -e "${GREEN}[✓]${NC} $*" | tee -a "$LOG"; }
+fail() { echo -e "${RED}[✗]${NC} $*" | tee -a "$LOG"; }
 section() {
     echo "" | tee -a "$LOG"
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}" | tee -a "$LOG"
@@ -60,6 +62,14 @@ section() {
 }
 
 PROTOCOL="${1:-A}"   # 第一个参数：A 或 C
+# 第二个参数：要测试的服务，逗号分隔，默认 all
+_svc_arg="${2:-all}"
+case "$_svc_arg" in
+    all|"mysql,nsq"|"nsq,mysql") TEST_MYSQL=1; TEST_NSQ=1 ;;
+    mysql)  TEST_MYSQL=1; TEST_NSQ=0 ;;
+    nsq)    TEST_MYSQL=0; TEST_NSQ=1 ;;
+    *)      TEST_MYSQL=1; TEST_NSQ=1 ;;
+esac
 
 # =============================================================================
 # 工具函数
@@ -161,6 +171,11 @@ grep -r "protocol" /etc/drbd.d/ | tee -a "$LOG"
 
 section "阶段1：MySQL 环境准备"
 
+if [ "$TEST_MYSQL" -eq 0 ]; then
+    info "（跳过 MySQL，--services 未包含 mysql）"
+    BEFORE_LSN="N/A"; AFTER_LSN="N/A"
+else
+
 info "检查 MySQL 服务..."
 if ! systemctl is-active mysqld --quiet; then
     info "启动 MySQL..."
@@ -178,7 +193,6 @@ CREATE TABLE iops_trace (
     ts   TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;" 2>/dev/null || {
     err "建表失败，检查 MySQL 连接..."
-    # 输出 MySQL 错误详情帮助诊断
     mysql_cmd -e "SELECT 1;" 2>&1 | tee -a "$LOG" || true
     exit 1
 }
@@ -191,11 +205,18 @@ mysql_cmd drbd_test -e \
     > "${RESULT_DIR}/mysql_baseline.txt" 2>/dev/null
 cat "${RESULT_DIR}/mysql_baseline.txt" | tee -a "$LOG"
 
+fi # TEST_MYSQL
+
 # =============================================================================
 # 准备 NSQ
 # =============================================================================
 
 section "阶段2：NSQ 环境准备"
+
+if [ "$TEST_NSQ" -eq 0 ]; then
+    info "（跳过 NSQ，--services 未包含 nsq）"
+    NSQ_DATA_DIR="/database/nsq/data/nsqd"
+else
 
 # 直接使用已知路径，不依赖 systemctl cat 提取
 NSQ_DATA_DIR="/database/nsq/data/nsqd"
@@ -213,10 +234,7 @@ NSQ_RUNNING="inactive"
 if systemctl is-active nsqd --quiet 2>/dev/null; then
     NSQ_RUNNING="active"
 else
-    # pgrep 未找到时返回1，用 true 避免触发 set -e
-    if pgrep -x nsqd > /dev/null 2>&1 || true; then
-        pgrep -x nsqd > /dev/null 2>&1 && NSQ_RUNNING="active(direct)" || true
-    fi
+    pgrep -x nsqd > /dev/null 2>&1 && NSQ_RUNNING="active(direct)" || true
 fi
 info "NSQd 状态: ${NSQ_RUNNING}"
 
@@ -251,6 +269,8 @@ find "${NSQ_DATA_DIR}" -name "*.dat" 2>/dev/null \
      | while read -r f; do stat "$f" 2>/dev/null; done \
      > "${RESULT_DIR}/nsq_files_baseline.txt" || true
 
+fi # TEST_NSQ
+
 # =============================================================================
 # 设置 IO 拦截器（nfqueue / iptables 方案）
 # =============================================================================
@@ -273,33 +293,89 @@ USE_CONNBYTES="${USE_CONNBYTES:-0}"
 cat > /tmp/drbd_interceptor.py << 'PYEOF'
 #!/usr/bin/env python3
 """
-DRBD IO 帧级拦截器
+DRBD IO 帧级拦截器（无 scapy 依赖，纯 struct 解析）
 用法: python3 drbd_interceptor.py <max_frames> <ready_file>
-  max_frames : 允许通过的 DRBD 数据帧数量
+  max_frames : 允许通过的真实 DRBD P_DATA 帧数量
   ready_file : 就绪信号文件路径
+
+IP header:  version/ihl(1) tos(1) tot_len(2) id(2) frag(2) ttl(1) proto(1) cksum(2) src(4) dst(4)
+            ihl 字段低4位 × 4 = IP 头长度（通常 20 字节）
+TCP header: sport(2) dport(2) seq(4) ack(4) offset/flags(2) window(2) cksum(2) urg(2)
+            offset 字段高4位 × 4 = TCP 头长度（通常 20 字节）
+DRBD wire:  magic(4) command(2) length(2)  [8.4.x 和 9.x 共用]
+            8.4.x magic = 0x83740000
+            9.0.x magic = 0x83740002
+            P_DATA command = 0x0000
 """
-import sys, os, signal, struct
+import sys, os, signal, struct, subprocess
 
-sys.modules['scapy.layers.dcerpc'] = None
-sys.modules['scapy.layers.kerberos'] = None
-sys.modules['scapy.layers.smbclient'] = None
+MAX_FRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 2
+READY_FILE = sys.argv[2]       if len(sys.argv) > 2 else "/tmp/interceptor_ready"
+DRBD_PORT  = 7789
 
-MAX_FRAMES   = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-READY_FILE   = sys.argv[2]       if len(sys.argv) > 2 else "/tmp/interceptor_ready"
-DRBD_PORT    = 7789
-MIN_PAYLOAD  = 32   # 小于此值视为纯 ACK/控制包
+# DRBD magic: 兼容 8.4.x 和 9.0.x
+DRBD_MAGICS   = {0x83740000, 0x83740002}
+DRBD_HDR_SIZE = 8       # magic(4) + command(2) + length(2)
+DRBD_CMD_DATA = 0x0000  # P_DATA — 真实写数据帧
 
-frame_count  = 0
-drop_count   = 0
-drop_mode    = False
+pass_count = 0
+drop_count = 0
+ctrl_count = 0
+drop_mode  = False
+
+def extract_tcp_payload(raw_ip_bytes):
+    """
+    从原始 IP 包字节中提取 TCP payload。
+    返回 bytes，解析失败返回 b''。
+    """
+    if len(raw_ip_bytes) < 20:
+        return b''
+    # IP header length = (ihl & 0x0f) * 4
+    ihl = (raw_ip_bytes[0] & 0x0f) * 4
+    proto = raw_ip_bytes[9]
+    if proto != 6:          # 只处理 TCP (proto=6)
+        return b''
+    if len(raw_ip_bytes) < ihl + 20:
+        return b''
+    tcp_start = ihl
+    # TCP data offset = high 4 bits of byte [12] * 4
+    tcp_doff = (raw_ip_bytes[tcp_start + 12] >> 4) * 4
+    payload_start = tcp_start + tcp_doff
+    if payload_start >= len(raw_ip_bytes):
+        return b''
+    return raw_ip_bytes[payload_start:]
+
+def scan_drbd_frames(tcp_payload):
+    """
+    扫描 TCP payload 中的 DRBD 帧。
+    返回 (data_frame_count, ctrl_frame_count)。
+    一个 TCP segment 可能包含多个连续 DRBD 帧（TCP coalescing）。
+    """
+    data_frames = 0
+    ctrl_frames = 0
+    offset = 0
+    buf = tcp_payload
+    while offset + DRBD_HDR_SIZE <= len(buf):
+        try:
+            magic, cmd, length = struct.unpack_from('>IHH', buf, offset)
+        except struct.error:
+            break
+        if magic not in DRBD_MAGICS:
+            break   # 不是 DRBD 帧，停止扫描
+        if cmd == DRBD_CMD_DATA and length > 0:
+            data_frames += 1
+        else:
+            ctrl_frames += 1
+        # 前进到下一帧
+        offset += DRBD_HDR_SIZE + length
+    return data_frames, ctrl_frames
 
 def cleanup(sig=None, frame=None):
-    import subprocess
     subprocess.run(['iptables', '-D', 'OUTPUT', '-p', 'tcp',
                     '--dport', str(DRBD_PORT), '-j', 'NFQUEUE',
                     '--queue-num', '0'], capture_output=True)
-    print(f"[interceptor] 清理完成 passed={frame_count} dropped={drop_count}",
-          flush=True)
+    print(f"[interceptor] 退出: data_passed={pass_count} "
+          f"data_dropped={drop_count} ctrl_passthrough={ctrl_count}", flush=True)
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, cleanup)
@@ -307,51 +383,80 @@ signal.signal(signal.SIGINT,  cleanup)
 
 try:
     from netfilterqueue import NetfilterQueue
-    from scapy.all import IP, TCP
 
     def process(pkt):
-        global frame_count, drop_count, drop_mode
-        payload = pkt.get_payload()
-        scapy_pkt = IP(payload)
+        global pass_count, drop_count, ctrl_count, drop_mode
+        raw = pkt.get_payload()
 
+        tcp_payload = extract_tcp_payload(raw)
+        if len(tcp_payload) < DRBD_HDR_SIZE:
+            pkt.accept()
+            return
+
+        data_cnt, ctrl_cnt = scan_drbd_frames(tcp_payload)
+
+        if data_cnt == 0 and ctrl_cnt == 0:
+            # 非 DRBD 流量，直接放行
+            pkt.accept()
+            return
+
+        if data_cnt == 0:
+            # 只含控制/心跳帧，无条件放行
+            ctrl_count += ctrl_cnt
+            pkt.accept()
+            return
+
+        # 含真实数据帧
         if drop_mode:
-            drop_count += 1
-            print(f"[interceptor] DROP frame={frame_count} "
-                  f"drop={drop_count} size={len(payload)}", flush=True)
+            drop_count += data_cnt
+            print(f"[interceptor] DROP data_frames={data_cnt} "
+                  f"total_drop={drop_count} tcp_payload={len(tcp_payload)}B", flush=True)
             pkt.drop()
             return
 
-        if scapy_pkt.haslayer(TCP):
-            tcp_payload = len(scapy_pkt[TCP].payload)
-            if tcp_payload >= MIN_PAYLOAD:
-                frame_count += 1
-                print(f"[interceptor] PASS frame={frame_count} "
-                      f"tcp_data={tcp_payload}B", flush=True)
-                if frame_count >= MAX_FRAMES:
-                    print(f"[interceptor] *** 已通过 {MAX_FRAMES} 帧，"
-                          f"切换 DROP 模式 ***", flush=True)
-                    drop_mode = True
-
+        pass_count += data_cnt
+        print(f"[interceptor] PASS data_frames={data_cnt} "
+              f"total_pass={pass_count}/{MAX_FRAMES} tcp_payload={len(tcp_payload)}B", flush=True)
+        if pass_count >= MAX_FRAMES:
+            drop_mode = True
+            print(f"[interceptor] *** 已通过 {pass_count} 个数据帧，"
+                  f"切换 DROP 模式（控制/心跳仍放行）***", flush=True)
         pkt.accept()
 
-    import subprocess
     subprocess.run(['iptables', '-I', 'OUTPUT', '-p', 'tcp',
                     '--dport', str(DRBD_PORT), '-j', 'NFQUEUE',
                     '--queue-num', '0'], check=False)
 
-    # 写入就绪信号
-    open(READY_FILE, 'w').write('ready')
-    print(f"[interceptor] 启动成功，最多允许 {MAX_FRAMES} 个数据帧通过",
-          flush=True)
-
     nfq = NetfilterQueue()
     nfq.bind(0, process)
-    nfq.run()
+
+    # ── 关键时序修复 ──────────────────────────────────────────────────
+    # nfq.run() 是阻塞事件循环。必须先让它进入监听状态，
+    # 再写 READY_FILE 通知主脚本开始 MySQL 事务。
+    # 否则：主脚本收到信号 → MySQL 提交 → DRBD IO → NFQUEUE 里的包
+    #        无消费者 → 内核超时丢弃 → process() 永远不被调用。
+    # 解决：在子线程里启动 run()，主线程等事件循环就绪后再写 READY_FILE。
+    import threading, time as _time
+    _loop_ready = threading.Event()
+
+    def _run_nfq():
+        _loop_ready.set()   # run() 即将被调用，通知主线程
+        nfq.run()
+
+    _t = threading.Thread(target=_run_nfq, daemon=True)
+    _t.start()
+    _loop_ready.wait(timeout=3)
+    _time.sleep(0.2)        # 额外等待 200ms，确保内核 nfqueue socket 就绪
+
+    print(f"[interceptor] nfqueue 模式启动，最多允许 {MAX_FRAMES} 个 P_DATA 帧通过",
+          flush=True)
+    open(READY_FILE, 'w').write('ready')
+
+    _t.join()   # 等待事件循环退出（由 SIGTERM → cleanup → sys.exit() 终止）
 
 except ImportError:
-    # 降级：使用 connbytes iptables 规则
-    import subprocess, sys
-    ALLOW_BYTES = MAX_FRAMES * 600  # 粗略估算每帧约 600 字节
+    # nfqueue 不可用，降级到 connbytes → 纯 DROP
+    ALLOW_BYTES = MAX_FRAMES * 16384
     result = subprocess.run([
         'iptables', '-A', 'OUTPUT', '-p', 'tcp',
         '-d', '192.168.171.131', '--dport', str(DRBD_PORT),
@@ -362,19 +467,16 @@ except ImportError:
         '-j', 'DROP'
     ], capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"[interceptor] connbytes 规则添加失败（可能缺少 xt_connbytes 模块）: {result.stderr.strip()}",
-              flush=True)
-        print(f"[interceptor] 降级为纯 iptables DROP 方式", flush=True)
-        # 最终降级：直接 DROP 所有 DRBD OUTPUT（无字节计数）
+        print(f"[interceptor] connbytes 不可用: {result.stderr.strip()}", flush=True)
+        print(f"[interceptor] 降级为纯 DROP（立即切断所有 DRBD OUTPUT）", flush=True)
         subprocess.run([
             'iptables', '-A', 'OUTPUT', '-p', 'tcp',
             '-d', '192.168.171.131', '--dport', str(DRBD_PORT),
             '-j', 'DROP'
         ], capture_output=True)
     else:
-        print(f"[interceptor] connbytes 模式启动，允许前 {ALLOW_BYTES} 字节", flush=True)
+        print(f"[interceptor] connbytes 模式: 允许前 {ALLOW_BYTES} 字节后 DROP", flush=True)
     open(READY_FILE, 'w').write('ready')
-    # 保持进程存活
     import time
     while True:
         time.sleep(1)
@@ -384,8 +486,8 @@ READY_FILE="/tmp/interceptor_ready"
 INTERCEPTOR_LOG="/tmp/interceptor.log"
 rm -f "$READY_FILE"
 
-info "启动 IO 拦截器（允许 20 个 DRBD 数据帧通过后切断）..."
-python3 /tmp/drbd_interceptor.py 20 "$READY_FILE" \
+info "启动 IO 拦截器（允许 2 个 DRBD 数据帧通过后切断）..."
+python3 /tmp/drbd_interceptor.py 2 "$READY_FILE" \
         > "$INTERCEPTOR_LOG" 2>&1 &
 INTERCEPT_PID=$!
 echo "$INTERCEPT_PID" > /tmp/interceptor.pid
@@ -412,11 +514,18 @@ fi
 
 section "阶段4：MySQL 写入实验（Protocol ${PROTOCOL}）"
 
-# 启动 DRBD 流量抓包
+if [ "$TEST_MYSQL" -eq 0 ]; then
+    info "（跳过 MySQL 写入，--services 未包含 mysql）"
+    BEFORE_LSN="N/A"; AFTER_LSN="N/A"
+    TCPDUMP_PID=""
+else
+
+# 启动 DRBD 流量抓包（给 tcpdump 100ms 启动时间）
 tcpdump -i any -w "${RESULT_DIR}/drbd_traffic.pcap" \
         "tcp port ${DRBD_PORT}" \
         2>/dev/null &
 TCPDUMP_PID=$!
+sleep 0.2   # 确保 tcpdump 完成 socket 绑定再开始事务
 
 # 记录执行前 LSN
 BEFORE_LSN=$(mysql_cmd -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null \
@@ -436,7 +545,6 @@ fi
 
 log "【MySQL 事务开始】$(date '+%H:%M:%S.%6N')"
 
-# 执行测试事务（多行INSERT + UPDATE，产生多个 IO：undo+redo+binlog+数据页）
 mysql_cmd drbd_test -e "
 START TRANSACTION;
 INSERT INTO iops_trace (val) VALUES
@@ -449,7 +557,6 @@ COMMIT;" 2>/dev/null || warn "事务执行失败或部分完成（IO拦截导致
 MYSQL_EXIT=$?
 log "【MySQL 事务结束】$(date '+%H:%M:%S.%6N') exit=${MYSQL_EXIT}"
 
-# 记录主节点提交后的数据（事务已在主节点提交）
 mysql_cmd drbd_test -e \
     "SELECT id, val, ts FROM iops_trace ORDER BY id;" \
     > "${RESULT_DIR}/mysql_primary_after_commit.txt" 2>/dev/null || true
@@ -458,18 +565,23 @@ AFTER_LSN=$(mysql_cmd -e "SHOW ENGINE INNODB STATUS\G" 2>/dev/null \
             | grep "Log sequence number" | awk '{print $NF}' | head -1 || true)
 info "事务后 InnoDB LSN: ${AFTER_LSN:-unavailable}"
 
-# 记录 binlog 位置
 mysql_cmd -e "SHOW MASTER STATUS\G" \
     > "${RESULT_DIR}/mysql_binlog_pos.txt" 2>/dev/null || true
 
 info "主节点提交后数据："
 cat "${RESULT_DIR}/mysql_primary_after_commit.txt" | tee -a "$LOG"
 
+fi # TEST_MYSQL
+
 # =============================================================================
 # ─── NSQ 实验 ─────────────────────────────────────────────────────────────────
 # =============================================================================
 
 section "阶段5：NSQ 写入实验（Protocol ${PROTOCOL}）"
+
+if [ "$TEST_NSQ" -eq 0 ]; then
+    info "（跳过 NSQ 写入，--services 未包含 nsq）"
+else
 
 # 记录 NSQ meta.dat 写入前状态
 info "写入前 NSQ diskqueue 文件状态："
@@ -501,28 +613,26 @@ PYEOF
 NSQ_MSG="DRBD_TEST_MSG_$(date +%s%N)_partial_io_experiment_payload"
 log "发送 NSQ 消息: ${NSQ_MSG}"
 
-# 先发送消息（DRBD 连接存在时发送，让 nsqd 正常写入并触发 DRBD 同步）
-# Protocol C 的实验意义：消息写入后 DRBD 同步过程被中断，观察备节点是否有完整数据
 log "【NSQ 消息发送开始】$(date '+%H:%M:%S.%6N')"
-NSQ_RESULT=$(curl -s --max-time 10 -w "\n%{http_code}" \
+NSQ_HTTP_RESP=$(curl -s --max-time 10 -w "\n%{http_code}" \
                   -d "${NSQ_MSG}" \
                   "${NSQ_HTTP}/pub?topic=${TOPIC}" 2>/dev/null || echo -e "\n000")
-NSQ_HTTP_CODE=$(echo "$NSQ_RESULT" | tail -1)
+NSQ_HTTP_CODE=$(echo "$NSQ_HTTP_RESP" | tail -1)
 log "【NSQ 消息发送结束】$(date '+%H:%M:%S.%6N') HTTP=${NSQ_HTTP_CODE}"
 
 if [ "$NSQ_HTTP_CODE" != "200" ]; then
     warn "NSQ 发送返回 HTTP=${NSQ_HTTP_CODE}，nsqd 可能未就绪或写入失败"
 fi
 
-# 等待 nsqd 完成 fsync（mem-queue-size=0 时每条消息都会同步落盘）
+# 等待 nsqd fsync 落盘
 sleep 2
 
-# 发送完成后再切断 DRBD，制造「消息已写入主节点但同步状态未知」的场景
+# 发送完成后再切断 DRBD
 info "切断 DRBD 连接（制造部分同步场景）..."
 drbdadm disconnect ${DRBD_RES} 2>/dev/null || true
 sleep 1
 
-# 记录写入后 meta.dat 状态
+# 记录写入后 meta.dat
 python3 << PYEOF | tee "${RESULT_DIR}/nsq_meta_after_primary.txt" | tee -a "$LOG"
 import struct, glob
 files = glob.glob('${NSQ_DATA_DIR}/**/*.meta.dat', recursive=True)
@@ -544,15 +654,15 @@ for f in files:
         print(f"    读取失败: {e}")
 PYEOF
 
-# 记录 .dat 数据文件内容（16进制，用于对比）
 find "${NSQ_DATA_DIR}" -name "*.dat" ! -name "*.meta.dat" 2>/dev/null | \
     while read -r f; do
         hexdump -C "$f" 2>/dev/null
     done > "${RESULT_DIR}/nsq_dat_primary.txt"
 
-# 记录 NSQ 队列统计
 curl -s "${NSQ_HTTP}/stats?format=json" \
      > "${RESULT_DIR}/nsq_stats_primary.json" 2>/dev/null || true
+
+fi # TEST_NSQ
 
 # =============================================================================
 # 模拟主节点故障
@@ -560,44 +670,83 @@ curl -s "${NSQ_HTTP}/stats?format=json" \
 
 section "阶段6：模拟主节点故障"
 
-kill "$TCPDUMP_PID" 2>/dev/null || true
+[ -n "$TCPDUMP_PID" ] && kill "$TCPDUMP_PID" 2>/dev/null || true
 sleep 1
 
-# 统计已同步帧数（tr 去掉换行防止输出截断）
-PASSED=$(grep -c "PASS frame" "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
-DROPPED=$(grep -c "DROP frame" "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
-PASSED=$(echo "$PASSED" | tr -d '[:space:]')
+# 统计拦截帧数（匹配新日志格式 "PASS data_frame" / "DROP data_frame"）
+PASSED=$(grep -c "PASS data_frame"  "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
+DROPPED=$(grep -c "DROP data_frame" "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
+PASSED=$(echo "$PASSED"  | tr -d '[:space:]')
 DROPPED=$(echo "$DROPPED" | tr -d '[:space:]')
-info "拦截统计：已通过 ${PASSED} 个 DRBD 帧，已丢弃 ${DROPPED} 个帧"
+info "拦截统计：真实数据帧已通过 ${PASSED} 个，已丢弃 ${DROPPED} 个（心跳/控制包不计入）"
 cat "$INTERCEPTOR_LOG" 2>/dev/null | tee -a "$LOG" || true
 
-# 分析抓包文件（统计 DRBD 数据帧数量）
 if [ -f "${RESULT_DIR}/drbd_traffic.pcap" ]; then
     DRBD_FRAMES=$(tcpdump -r "${RESULT_DIR}/drbd_traffic.pcap" -n \
                           "tcp and len > 40" 2>/dev/null | wc -l || echo "0")
     info "PCAP 中 DRBD 数据帧总数: ${DRBD_FRAMES}"
 fi
 
-info "停止 MySQL 和 NSQ 服务（模拟主节点应用层故障）..."
-systemctl stop mysqld 2>/dev/null || true
-systemctl stop nsqd   2>/dev/null || true
+# ── 正确降级顺序，防止双 Primary 脑裂 ────────────────────────────────
+# 1. 停止应用服务（释放文件系统 IO 和锁）
+# 2. umount（释放块设备，drbdadm secondary 在设备挂载时会报 busy）
+# 3. drbdadm secondary（设备已卸载，连接仍在线，对端可无缝感知）
+# 4. iptables 封锁 DRBD 端口（彻底切断网络，模拟断电）
+# ─────────────────────────────────────────────────────────────────────
 
-info "主节点 DRBD 降级为 Secondary（为备节点接管让路）..."
-drbdadm secondary ${DRBD_RES} 2>/dev/null || true
+info "① 停止应用服务（释放文件系统 IO）..."
+[ "$TEST_MYSQL" -eq 1 ] && systemctl stop mysqld 2>/dev/null || true
+[ "$TEST_NSQ"   -eq 1 ] && systemctl stop nsqd   2>/dev/null || true
+# 兜底：停止所有可能占用 /database 的服务（防止 --services 单选漏停）
+systemctl is-active mysqld --quiet 2>/dev/null && systemctl stop mysqld 2>/dev/null || true
+systemctl is-active nsqd   --quiet 2>/dev/null && systemctl stop nsqd   2>/dev/null || true
 sleep 1
 
-info "完全隔离 DRBD 网络（模拟主节点断电/断网）..."
+info "② 卸载 DRBD 文件系统（释放 /dev/drbd1 块设备占用）..."
+sync
+if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
+    umount "${MOUNT_POINT}" 2>/dev/null || {
+        warn "umount 失败，查看占用进程后尝试 lazy umount..."
+        fuser -mv "${MOUNT_POINT}" 2>/dev/null | tee -a "$LOG" || true
+        umount -l "${MOUNT_POINT}" 2>/dev/null || \
+            warn "lazy umount 也失败，降级可能报 Device busy"
+    }
+    ok "文件系统已卸载"
+else
+    info "${MOUNT_POINT} 未挂载，跳过 umount"
+fi
+
+info "③ 将本节点 DRBD 降级为 Secondary（DRBD 连接仍在线，对端可感知）..."
+drbdadm secondary ${DRBD_RES} 2>&1 | tee -a "$LOG" || {
+    warn "首次降级失败，2s 后重试..."
+    sleep 2
+    drbdadm secondary ${DRBD_RES} 2>&1 | tee -a "$LOG" || {
+        warn "降级重试仍失败，检查 /dev/drbd1 占用："
+        fuser -m /dev/drbd1 2>/dev/null | tee -a "$LOG" || true
+    }
+}
+sleep 1
+
+_role=$(drbdadm status ${DRBD_RES} 2>/dev/null \
+        | grep -o 'role:[A-Za-z]*' | head -1 | cut -d: -f2 || echo "Unknown")
+info "当前 DRBD 角色: ${_role}"
+if [ "$_role" = "Primary" ]; then
+    warn "降级未生效（仍为 Primary）"
+else
+    ok "DRBD 已降级为 ${_role:-Secondary}"
+fi
+
+info "④ 完全隔离 DRBD 网络（模拟主节点断电/断网）..."
 iptables -I INPUT  -p tcp --sport "${DRBD_PORT}" -j DROP 2>/dev/null || true
 iptables -I OUTPUT -p tcp --dport "${DRBD_PORT}" -j DROP 2>/dev/null || true
 iptables -I INPUT  -p tcp --dport "${DRBD_PORT}" -j DROP 2>/dev/null || true
 iptables -I OUTPUT -p tcp --sport "${DRBD_PORT}" -j DROP 2>/dev/null || true
 
-# 停止拦截器进程
+# 停止拦截器
 kill "$INTERCEPT_PID" 2>/dev/null || true
 iptables -D OUTPUT -p tcp --dport "${DRBD_PORT}" -j NFQUEUE \
          --queue-num 0 2>/dev/null || true
 
-# 保存最终 DRBD 状态
 check_drbd_status > "${RESULT_DIR}/drbd_after_fault.txt" 2>&1 || true
 info "主节点故障模拟完成"
 
@@ -610,27 +759,32 @@ section "阶段7：打包主节点结果"
 # 汇总所有关键信息到单一结果文件
 {
     echo "===== DRBD 主节点实验结果 ====="
-    echo "Protocol: ${PROTOCOL}"
-    echo "时间: $(date)"
+    echo "Protocol : ${PROTOCOL}"
+    echo "Services : $([ $TEST_MYSQL -eq 1 ] && echo -n 'mysql '; [ $TEST_NSQ -eq 1 ] && echo -n 'nsq')"
+    echo "时间     : $(date)"
     echo ""
 
-    echo "--- MySQL 事务前后数据对比 ---"
-    echo "[事务前]"
-    cat "${RESULT_DIR}/mysql_baseline.txt" 2>/dev/null
-    echo "[事务后（主节点已提交）]"
-    cat "${RESULT_DIR}/mysql_primary_after_commit.txt" 2>/dev/null
-    echo "[LSN 变化] before=${BEFORE_LSN} after=${AFTER_LSN}"
-    echo "[Binlog 位置]"
-    cat "${RESULT_DIR}/mysql_binlog_pos.txt" 2>/dev/null
+    if [ "$TEST_MYSQL" -eq 1 ]; then
+        echo "--- MySQL 事务前后数据对比 ---"
+        echo "[事务前]"
+        cat "${RESULT_DIR}/mysql_baseline.txt" 2>/dev/null
+        echo "[事务后（主节点已提交）]"
+        cat "${RESULT_DIR}/mysql_primary_after_commit.txt" 2>/dev/null
+        echo "[LSN 变化] before=${BEFORE_LSN} after=${AFTER_LSN}"
+        echo "[Binlog 位置]"
+        cat "${RESULT_DIR}/mysql_binlog_pos.txt" 2>/dev/null
+        echo ""
+    fi
 
-    echo ""
-    echo "--- NSQ meta.dat 写入前后对比 ---"
-    echo "[写入前]"
-    cat "${RESULT_DIR}/nsq_meta_before.txt" 2>/dev/null
-    echo "[写入后（主节点）]"
-    cat "${RESULT_DIR}/nsq_meta_after_primary.txt" 2>/dev/null
+    if [ "$TEST_NSQ" -eq 1 ]; then
+        echo "--- NSQ meta.dat 写入前后对比 ---"
+        echo "[写入前]"
+        cat "${RESULT_DIR}/nsq_meta_before.txt" 2>/dev/null
+        echo "[写入后（主节点）]"
+        cat "${RESULT_DIR}/nsq_meta_after_primary.txt" 2>/dev/null
+        echo ""
+    fi
 
-    echo ""
     echo "--- DRBD IO 拦截统计 ---"
     cat "$INTERCEPTOR_LOG" 2>/dev/null
 

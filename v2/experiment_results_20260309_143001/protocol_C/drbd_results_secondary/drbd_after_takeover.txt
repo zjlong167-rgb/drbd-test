@@ -1,0 +1,3 @@
+r0 role:Primary
+  disk:UpToDate open:no
+  node1 connection:StandAlone

@@ -1,0 +1,6 @@
+
+  文件: /database/nsq/data/nsqd/test_topic.diskqueue.meta.dat
+    文件大小 11 bytes, 内容: 310a302c300a302c34390a
+
+  文件: /database/nsq/data/nsqd/drbd_test_topic.diskqueue.meta.dat
+    文件大小 12 bytes, 内容: 360a302c300a302c3339330a

@@ -4,10 +4,24 @@
 # 功能：上传脚本 → 协调主备节点实验 → 收集结果 → 生成报告 → 恢复环境
 #
 # 用法:
-#   ./run_experiment.sh           # 运行 Protocol A 实验
-#   ./run_experiment.sh A         # 运行 Protocol A 实验
-#   ./run_experiment.sh C         # 运行 Protocol C 实验
-#   ./run_experiment.sh both      # 依次运行 A 和 C 并生成对比报告
+#   ./run_experiment.sh [PROTOCOL] [--services SVC1,SVC2]
+#
+#   PROTOCOL:
+#     A            只运行 Protocol A 实验（默认）
+#     C            只运行 Protocol C 实验
+#     both         依次运行 A 和 C 并生成对比报告
+#
+#   --services:
+#     mysql        只测试 MySQL
+#     nsq          只测试 NSQ
+#     mysql,nsq    同时测试 MySQL 和 NSQ（默认，等同于 all）
+#     all          同上
+#
+# 示例:
+#   ./run_experiment.sh C                         # Protocol C，测全部服务
+#   ./run_experiment.sh A --services mysql         # Protocol A，只测 MySQL
+#   ./run_experiment.sh both --services nsq        # A+C 对比，只测 NSQ
+#   ./run_experiment.sh C --services mysql,nsq     # Protocol C，测全部
 # =============================================================================
 
 set -euo pipefail
@@ -23,12 +37,58 @@ SSH_PASS="123456"
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 \
           -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 
+DRBD_RES="r0"
+DRBD_PORT=7789
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PRIMARY_SCRIPT="${SCRIPT_DIR}/primary_node.sh"
 SECONDARY_SCRIPT="${SCRIPT_DIR}/secondary_node.sh"
 RESULTS_DIR="${SCRIPT_DIR}/experiment_results_$(date '+%Y%m%d_%H%M%S')"
 
-PROTOCOL="${1:-A}"
+PROTOCOL="A"
+SERVICES="all"
+
+# 解析参数
+_args=("$@")
+_i=0
+while [ $_i -lt ${#_args[@]} ]; do
+    _arg="${_args[$_i]}"
+    case "$_arg" in
+        A|C|both)
+            PROTOCOL="$_arg"
+            ;;
+        --services)
+            _i=$((_i + 1))
+            SERVICES="${_args[$_i]:-all}"
+            ;;
+        --services=*)
+            SERVICES="${_arg#--services=}"
+            ;;
+        -h|--help)
+            sed -n '/#/p' "${BASH_SOURCE[0]}" | head -20
+            exit 0
+            ;;
+        *)
+            echo "未知参数: $_arg" >&2
+            exit 1
+            ;;
+    esac
+    _i=$((_i + 1))
+done
+
+# 规范化 SERVICES：all / mysql,nsq 均转为 "mysql nsq"
+case "$SERVICES" in
+    all|"mysql,nsq"|"nsq,mysql") SERVICES="mysql nsq" ;;
+    mysql)   SERVICES="mysql" ;;
+    nsq)     SERVICES="nsq" ;;
+    *)
+        echo "无效 --services 值: ${SERVICES}（可用: mysql / nsq / mysql,nsq / all）" >&2
+        exit 1
+        ;;
+esac
+
+# 构建传给节点脚本的 SERVICES 参数（空格替换为逗号方便 shell 传参）
+SERVICES_ARG=$(echo "$SERVICES" | tr ' ' ',')
 
 # 颜色
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -206,7 +266,7 @@ run_single_experiment() {
     # 执行主节点脚本，实时流式输出
     PRIMARY_EXIT=0
     ssh_stream "$PRIMARY_IP" "PRIMARY" \
-        "bash /tmp/primary_node.sh ${proto}" || PRIMARY_EXIT=$?
+        "bash /tmp/primary_node.sh ${proto} ${SERVICES_ARG}" || PRIMARY_EXIT=$?
 
     echo ""
 
@@ -253,10 +313,32 @@ run_single_experiment() {
         return 1
     fi
 
-    # ── 等待主节点完全隔离 ─────────────────────────────────────────────────
+    # ── 等待主节点完全隔离，并确认 DRBD 已降级 ──────────────────────────
 
     log "等待主节点故障状态稳定（3秒）..."
     sleep 3
+
+    # 强制确认主节点已降为 Secondary，防止双 Primary 脑裂
+    info "验证主节点 DRBD 已降级为 Secondary..."
+    _primary_drbd_role=$(ssh_cmd "$PRIMARY_IP" \
+        "drbdadm status ${DRBD_RES} 2>/dev/null | grep 'role:' | head -1 | grep -o 'role:[A-Za-z]*' | cut -d: -f2" \
+        2>/dev/null || echo "Unknown")
+
+    if [ "$_primary_drbd_role" = "Primary" ]; then
+        warn "主节点仍为 Primary（可能降级未完成），强制执行降级..."
+        ssh_cmd "$PRIMARY_IP" \
+            "drbdadm secondary ${DRBD_RES} 2>/dev/null || true" 2>/dev/null || true
+        sleep 2
+        _primary_drbd_role=$(ssh_cmd "$PRIMARY_IP" \
+            "drbdadm status ${DRBD_RES} 2>/dev/null | grep 'role:' | head -1 | grep -o 'role:[A-Za-z]*' | cut -d: -f2" \
+            2>/dev/null || echo "Unknown")
+    fi
+
+    if [ "$_primary_drbd_role" = "Secondary" ] || [ "$_primary_drbd_role" = "Unknown" ]; then
+        ok "主节点 DRBD 角色确认: ${_primary_drbd_role}，可安全启动备节点接管"
+    else
+        warn "主节点 DRBD 角色为 ${_primary_drbd_role}，继续执行但存在脑裂风险"
+    fi
 
     # ── 阶段2：运行备节点接管脚本 ─────────────────────────────────────────
 
@@ -267,7 +349,7 @@ run_single_experiment() {
 
     SECONDARY_EXIT=0
     ssh_stream "$SECONDARY_IP" "SECONDARY" \
-        "bash /tmp/secondary_node.sh ${proto}" || SECONDARY_EXIT=$?
+        "bash /tmp/secondary_node.sh ${proto} ${SERVICES_ARG}" || SECONDARY_EXIT=$?
 
     echo ""
     if [ $SECONDARY_EXIT -eq 0 ]; then
@@ -372,8 +454,13 @@ RESTORE_EOF
 # 确保服务停止
 systemctl stop mysqld 2>/dev/null || true
 systemctl stop nsqd   2>/dev/null || true
+sleep 1
 
-# 卸载挂载点
+# 卸载所有 drbd1 挂载点（/proc/mounts 枚举，防止 EEXIST 残留）
+grep -w '/dev/drbd1' /proc/mounts 2>/dev/null | awk '{print $2}' | while read -r _mnt; do
+    echo "[restore] umount ${_mnt}..."
+    umount "${_mnt}" 2>/dev/null || umount -l "${_mnt}" 2>/dev/null || true
+done
 umount /database 2>/dev/null || umount -l /database 2>/dev/null || true
 
 # 降级为 secondary
@@ -440,14 +527,21 @@ generate_single_report() {
 
     # ── 计算关键指标 ──────────────────────────────────────────────────────
 
-    # MySQL 行数
-    PRIMARY_ROWS=$(wc -l < "$MYSQL_PRIMARY_FILE" 2>/dev/null | tr -d ' ' || echo "0")
+    # MySQL 行数（文件不存在时安全降级为 0）
+    PRIMARY_ROWS=0
+    [ -n "$MYSQL_PRIMARY_FILE" ] && [ -f "$MYSQL_PRIMARY_FILE" ] && \
+        PRIMARY_ROWS=$(wc -l < "$MYSQL_PRIMARY_FILE" 2>/dev/null | tr -d ' ') || true
     [ -z "$PRIMARY_ROWS" ] && PRIMARY_ROWS=0
-    SECONDARY_ROWS=$(wc -l < "$MYSQL_SECONDARY_FILE" 2>/dev/null | tr -d ' ' || echo "0")
+
+    SECONDARY_ROWS=0
+    [ -n "$MYSQL_SECONDARY_FILE" ] && [ -f "$MYSQL_SECONDARY_FILE" ] && \
+        SECONDARY_ROWS=$(wc -l < "$MYSQL_SECONDARY_FILE" 2>/dev/null | tr -d ' ') || true
     [ -z "$SECONDARY_ROWS" ] && SECONDARY_ROWS=0
 
     # MySQL 启动状态
-    MYSQL_START_STATUS=$(cat "$MYSQL_START_FILE" 2>/dev/null || echo "UNKNOWN")
+    MYSQL_START_STATUS="UNKNOWN"
+    [ -n "$MYSQL_START_FILE" ] && [ -f "$MYSQL_START_FILE" ] && \
+        MYSQL_START_STATUS=$(cat "$MYSQL_START_FILE" 2>/dev/null) || true
     if echo "$MYSQL_START_STATUS" | grep -q "SUCCESS"; then
         MYSQL_START_VERDICT="✓ 启动成功"
     elif echo "$MYSQL_START_STATUS" | grep -q "FAILED"; then
@@ -483,7 +577,9 @@ generate_single_report() {
     fi
 
     # NSQ 启动状态
-    NSQ_START_STATUS=$(cat "$NSQ_START_FILE" 2>/dev/null || echo "UNKNOWN")
+    NSQ_START_STATUS="UNKNOWN"
+    [ -n "$NSQ_START_FILE" ] && [ -f "$NSQ_START_FILE" ] && \
+        NSQ_START_STATUS=$(cat "$NSQ_START_FILE" 2>/dev/null) || true
     if echo "$NSQ_START_STATUS" | grep -q "SUCCESS"; then
         NSQ_START_VERDICT="✓ 启动成功"
     elif echo "$NSQ_START_STATUS" | grep -q "FAILED"; then
@@ -493,8 +589,14 @@ generate_single_report() {
     fi
 
     # NSQ meta.dat 一致性
-    PRI_WRITE_POS=$(grep "writePos" "$NSQ_META_PRIMARY_FILE" 2>/dev/null | awk '{print $NF}' | head -1 || echo "?")
-    SEC_WRITE_POS=$(grep "writePos" "$NSQ_META_SECONDARY_FILE" 2>/dev/null | awk '{print $NF}' | head -1 || echo "?")
+    PRI_WRITE_POS="?"
+    SEC_WRITE_POS="?"
+    [ -n "$NSQ_META_PRIMARY_FILE" ] && [ -f "$NSQ_META_PRIMARY_FILE" ] && \
+        PRI_WRITE_POS=$(grep "writePos" "$NSQ_META_PRIMARY_FILE" 2>/dev/null | awk '{print $NF}' | head -1) || true
+    [ -z "$PRI_WRITE_POS" ] && PRI_WRITE_POS="?"
+    [ -n "$NSQ_META_SECONDARY_FILE" ] && [ -f "$NSQ_META_SECONDARY_FILE" ] && \
+        SEC_WRITE_POS=$(grep "writePos" "$NSQ_META_SECONDARY_FILE" 2>/dev/null | awk '{print $NF}' | head -1) || true
+    [ -z "$SEC_WRITE_POS" ] && SEC_WRITE_POS="?"
     if [ "$PRI_WRITE_POS" = "?" ] || [ "$SEC_WRITE_POS" = "?" ]; then
         NSQ_META_VERDICT="? 未获取到 meta.dat 数据"
     elif [ "$PRI_WRITE_POS" = "$SEC_WRITE_POS" ]; then
@@ -503,12 +605,18 @@ generate_single_report() {
         NSQ_META_VERDICT="✗ meta.dat 不一致（主=${PRI_WRITE_POS} 备=${SEC_WRITE_POS}）"
     fi
 
-    # IO 拦截统计
+    # IO 拦截统计（匹配新日志格式）
     if [ -n "$INTERCEPTOR_FILE" ] && [ -s "$INTERCEPTOR_FILE" ]; then
-        PASS_CNT=$(grep -c "PASS frame" "$INTERCEPTOR_FILE" 2>/dev/null || echo 0)
-        DROP_CNT=$(grep -c "DROP frame" "$INTERCEPTOR_FILE" 2>/dev/null || echo 0)
-        INTERCEPT_MODE=$(grep -o "connbytes 模式\|nfqueue" "$INTERCEPTOR_FILE" 2>/dev/null | head -1 || echo "未知")
-        IO_VERDICT="通过 ${PASS_CNT} 帧，丢弃 ${DROP_CNT} 帧（${INTERCEPT_MODE}）"
+        PASS_CNT=$(grep -c "PASS data_frame" "$INTERCEPTOR_FILE" 2>/dev/null || echo 0)
+        DROP_CNT=$(grep -c "DROP data_frame" "$INTERCEPTOR_FILE" 2>/dev/null || echo 0)
+        if grep -q "nfqueue" "$INTERCEPTOR_FILE" 2>/dev/null; then
+            INTERCEPT_MODE="nfqueue+协议解析"
+        elif grep -q "connbytes" "$INTERCEPTOR_FILE" 2>/dev/null; then
+            INTERCEPT_MODE="connbytes 降级"
+        else
+            INTERCEPT_MODE="未知"
+        fi
+        IO_VERDICT="通过 ${PASS_CNT} 个数据帧，丢弃 ${DROP_CNT} 个（${INTERCEPT_MODE}）"
     else
         IO_VERDICT="（日志未找到）"
     fi
@@ -740,6 +848,7 @@ main() {
     echo "  Primary  : ${PRIMARY_IP}"
     echo "  Secondary: ${SECONDARY_IP}"
     echo "  Protocol : ${PROTOCOL}"
+    echo "  服务范围 : ${SERVICES}"
     echo "  结果目录 : ${RESULTS_DIR}"
     echo ""
 

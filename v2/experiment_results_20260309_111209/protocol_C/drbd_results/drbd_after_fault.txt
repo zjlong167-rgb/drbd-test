@@ -1,0 +1,5 @@
+r0 role:Primary
+  disk:UpToDate open:yes
+  node2 role:Secondary
+    peer-disk:UpToDate
+
