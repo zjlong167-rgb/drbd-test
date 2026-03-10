@@ -317,7 +317,7 @@ run_single_experiment() {
 
     log "等待主节点故障状态稳定（3秒）..."
     sleep 3
-
+    # exit 0
     # 强制确认主节点已降为 Secondary，防止双 Primary 脑裂
     info "验证主节点 DRBD 已降级为 Secondary..."
     _primary_drbd_role=$(ssh_cmd "$PRIMARY_IP" \
@@ -421,9 +421,9 @@ echo "[restore] 清理拦截器进程..."
 kill $(cat /tmp/interceptor.pid 2>/dev/null) 2>/dev/null || true
 pkill -f drbd_interceptor.py 2>/dev/null || true
 
-echo "[restore] 重启 DRBD 连接..."
-drbdadm connect r0 2>/dev/null || true
-sleep 3
+# echo "[restore] 重启 DRBD 连接..."
+# drbdadm connect r0 2>/dev/null || true
+# sleep 3
 
 echo "[restore] 当前 DRBD 状态："
 drbdadm status r0 2>/dev/null
@@ -433,20 +433,20 @@ RESTORE_EOF
 
     # ── 等待 DRBD 重新同步 ─────────────────────────────────────────────────
 
-    info "等待 DRBD 重新同步（最多 60 秒）..."
-    for i in $(seq 1 30); do
-        STATUS=$(ssh_cmd "$PRIMARY_IP" \
-                 "drbdadm status r0 2>/dev/null | grep 'peer-disk:' | head -1" \
-                 2>/dev/null || echo "")
-        if echo "$STATUS" | grep -q "peer-disk:UpToDate" 2>/dev/null; then
-            if echo "$STATUS" | grep -q "peer-disk:UpToDate"; then
-                ok "DRBD 重新同步完成: ${STATUS}"
-                break
-            fi
-        fi
-        [ $((i % 5)) -eq 0 ] && info "DRBD 同步中... ${STATUS:-connecting} (${i}/30)"
-        sleep 2
-    done
+    # info "等待 DRBD 重新同步（最多 60 秒）..."
+    # for i in $(seq 1 30); do
+    #     STATUS=$(ssh_cmd "$PRIMARY_IP" \
+    #              "drbdadm status r0 2>/dev/null | grep 'peer-disk:' | head -1" \
+    #              2>/dev/null || echo "")
+    #     if echo "$STATUS" | grep -q "peer-disk:UpToDate" 2>/dev/null; then
+    #         if echo "$STATUS" | grep -q "peer-disk:UpToDate"; then
+    #             ok "DRBD 重新同步完成: ${STATUS}"
+    #             break
+    #         fi
+    #     fi
+    #     [ $((i % 5)) -eq 0 ] && info "DRBD 同步中... ${STATUS:-connecting} (${i}/30)"
+    #     sleep 2
+    # done
 
     # 备节点降级并重建
     info "备节点降级为 Secondary 并重建 DRBD 连接..."
@@ -468,9 +468,9 @@ drbdadm secondary r0 2>/dev/null || true
 sleep 2
 
 # 重新连接
-drbdadm connect r0 2>/dev/null || true
-sleep 3
-
+# drbdadm connect r0 2>/dev/null || true
+# sleep 3
+drbdadm disconnect r0 2>/dev/null || true
 echo "备节点 DRBD 状态:"
 drbdadm status r0 2>/dev/null
 RESTORE2_EOF
@@ -658,14 +658,16 @@ generate_single_report() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  [主节点 - 事务提交后（共 ${PRIMARY_ROWS} 行）]"
     if [ -n "$MYSQL_PRIMARY_FILE" ] && [ -s "$MYSQL_PRIMARY_FILE" ]; then
-        cat "$MYSQL_PRIMARY_FILE" | sed 's/^/    /'
+        # cat "$MYSQL_PRIMARY_FILE" | sed 's/^/    /'
+        echo "    (数据已找到，但为节省篇幅未展示)"
     else
         echo "    (数据未找到)"
     fi
     echo ""
     echo "  [备节点 - 接管启动后（共 ${SECONDARY_ROWS} 行）]"
     if [ -n "$MYSQL_SECONDARY_FILE" ] && [ -s "$MYSQL_SECONDARY_FILE" ]; then
-        cat "$MYSQL_SECONDARY_FILE" | sed 's/^/    /'
+        # cat "$MYSQL_SECONDARY_FILE" | sed 's/^/    /'
+        echo "    (数据已找到，但为节省篇幅未展示)"
     else
         echo "    (数据未找到或 MySQL 未能启动)"
     fi
@@ -745,12 +747,12 @@ generate_single_report() {
     echo ""
     if [ -n "$MYSQL_PRIMARY_FILE" ] && [ -s "$MYSQL_PRIMARY_FILE" ]; then
         echo -e "  ${BOLD}主节点写入数据（共 ${PRIMARY_ROWS} 行）:${NC}"
-        cat "$MYSQL_PRIMARY_FILE" | sed 's/^/    /'
+        # cat "$MYSQL_PRIMARY_FILE" | sed 's/^/    /'
         echo ""
     fi
     if [ -n "$MYSQL_SECONDARY_FILE" ] && [ -s "$MYSQL_SECONDARY_FILE" ]; then
         echo -e "  ${BOLD}备节点恢复数据（共 ${SECONDARY_ROWS} 行）:${NC}"
-        cat "$MYSQL_SECONDARY_FILE" | sed 's/^/    /'
+        # cat "$MYSQL_SECONDARY_FILE" | sed 's/^/    /'
     else
         echo -e "  ${BOLD}备节点恢复数据:${NC} ${RED}（无数据）${NC}"
     fi

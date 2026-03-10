@@ -3,8 +3,8 @@
 # secondary_node.sh - 在备节点 (192.168.171.131) 上执行
 # 功能：接管 DRBD → 挂载文件系统 → 分析数据 → 启动服务 → 验证一致性 → 恢复环境
 # =============================================================================
-
-set -euo pipefail
+set -eu
+# set -euo pipefail
 
 # ── ERR trap：捕获触发 set -e 的具体命令、行号、退出码 ──────────────────
 SECONDARY_ERROR_FILE="/tmp/secondary_error.txt"
@@ -442,7 +442,9 @@ if [ $STARTED -eq 1 ]; then
         > "${RESULT_DIR}/mysql_secondary_data.txt" 2>/dev/null
 
     info "备节点恢复后的数据："
-    cat "${RESULT_DIR}/mysql_secondary_data.txt" | tee -a "$LOG"
+    AFTER_ROW_COUNT=$(wc -l < "${RESULT_DIR}/mysql_secondary_data.txt" 2>/dev/null || echo "0")
+    info "主节点提交后 iops_trace 表行数: ${AFTER_ROW_COUNT}"
+    # cat "${RESULT_DIR}/mysql_secondary_data.txt" | tee -a "$LOG"
 
     # 行数对比
     PRIMARY_ROWS=$(wc -l < /tmp/primary_mysql_rows.txt 2>/dev/null || echo "?")
@@ -503,7 +505,7 @@ find "${NSQ_DATA_DIR}" -name "*.dat" 2>/dev/null | \
 
 info "--- meta.dat 内容解析（备节点，接管后）---"
 python3 << PYEOF | tee "${RESULT_DIR}/nsq_meta_secondary.txt" | tee -a "$LOG"
-import struct, glob, os
+import glob, os
 
 files = glob.glob('${NSQ_DATA_DIR}/**/*.meta.dat', recursive=True)
 if not files:
@@ -513,19 +515,18 @@ else:
         print(f"\n  文件: {f}")
         print(f"  文件大小: {os.path.getsize(f)} bytes")
         try:
-            data = open(f, 'rb').read()
-            if len(data) >= 24:
-                r, w, d = struct.unpack('>qqq', data[:24])
-                print(f"    readPos  = {r}")
-                print(f"    writePos = {w}")
-                print(f"    depth    = {d}")
-                print(f"    未读字节数 = {w - r}")
-                if w == r and d == 0:
+            with open(f, 'r') as fp:
+                lines = [line.strip() for line in fp.readlines()]
+            if len(lines) >= 3:
+                count = lines[0]
+                read_pos, write_pos = map(int, lines[1].split(','))
+                next_read_file, next_write_file = map(int, lines[2].split(','))
+                if write_pos == read_pos and count == 0:
                     print(f"    ★ 队列为空（meta 未更新 或 消息从未同步）")
-                elif w > r:
+                elif write_pos > read_pos:
                     print(f"    ★ 队列有数据（writePos > readPos）")
             else:
-                print(f"    文件不完整: {len(data)} bytes hex={data.hex()}")
+                print(f"    文件行数不足，内容: {lines}")
         except Exception as e:
             print(f"    读取失败: {e}")
 PYEOF
@@ -534,7 +535,7 @@ info "--- .dat 数据文件内容（备节点，16进制）---"
 find "${NSQ_DATA_DIR}" -name "*.dat" ! -name "*.meta.dat" 2>/dev/null | \
     while read -r f; do
         echo "=== $f ($(stat -c%s "$f") bytes) ==="
-        hexdump -C "$f" 2>/dev/null | head -30
+        (trap '' PIPE; hexdump -C "$f" 2>/dev/null | head -30) || true
     done | tee "${RESULT_DIR}/nsq_dat_secondary.txt" | tee -a "$LOG"
 
 # 对比 .dat 文件大小（检查数据是否写入但 meta 未更新）
@@ -562,14 +563,18 @@ for dat in data_files:
 
     if meta and os.path.exists(meta):
         data = open(meta, 'rb').read()
-        if len(data) >= 24:
-            r, w, d = struct.unpack('>qqq', data[:24])
-            print(f"  meta writePos: {w} bytes")
-            if dat_size > w:
-                diff = dat_size - w
+        with open(meta, 'r') as fp:
+            lines = [line.strip() for line in fp.readlines()]
+        if len(lines) >= 3:
+            version = lines[0]
+            read_pos, write_pos = map(int, lines[1].split(','))
+            next_read_file, next_write_file = map(int, lines[2].split(','))
+            print(f"  meta writePos: {write_pos} bytes")
+            if dat_size > write_pos:
+                diff = dat_size - write_pos
                 print(f"  ⚠  .dat 比 meta.writePos 大 {diff} bytes")
                 print(f"     → .dat 有数据但 meta 未记录（IO 部分同步的典型表现）")
-            elif dat_size == w:
+            elif dat_size == write_pos:
                 print(f"  ✓  .dat 大小与 meta.writePos 一致")
             else:
                 print(f"  ⚠  .dat 比 meta.writePos 小（meta 超前，可能导致读取错误）")
@@ -733,15 +738,8 @@ fi
     printf "║    NSQ   : %-59s ║\n" "$DATA_NSQ"
     echo "║                                                                      ║"
     echo "╠══════════════════════════════════════════════════════════════════════╣"
-    echo "║  主节点写入后的数据（共 3 行）:                                      ║"
-    echo "╠══════════════════════════════════════════════════════════════════════╣"
-    if [ -s "${RESULT_DIR}/mysql_secondary_data.txt" ]; then
-        while IFS= read -r line; do
-            printf "║  %-68s ║\n" "${line:0:68}"
-        done < "${RESULT_DIR}/mysql_secondary_data.txt"
-    else
-        echo "║  （无数据）                                                          ║"
-    fi
+    ROW_COUNT=$(wc -l < "${RESULT_DIR}/mysql_secondary_data.txt" 2>/dev/null || echo "0")
+    echo "║  主节点写入后的数据行数: ${ROW_COUNT} "
     echo "╚══════════════════════════════════════════════════════════════════════╝"
     echo ""
 

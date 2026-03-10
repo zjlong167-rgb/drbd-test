@@ -1,4 +1,0 @@
-r0 role:Secondary
-  disk:UpToDate open:no
-  node1 role:Secondary
-    peer-disk:UpToDate

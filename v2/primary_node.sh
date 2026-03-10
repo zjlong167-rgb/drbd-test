@@ -189,7 +189,7 @@ mysql_cmd drbd_test -e "DROP TABLE IF EXISTS iops_trace;" 2>/dev/null || true
 mysql_cmd drbd_test -e "
 CREATE TABLE iops_trace (
     id   BIGINT AUTO_INCREMENT PRIMARY KEY,
-    val  VARCHAR(512) NOT NULL,
+    val  TEXT NOT NULL,
     ts   TIMESTAMP(6) DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;" 2>/dev/null || {
     err "建表失败，检查 MySQL 连接..."
@@ -292,202 +292,156 @@ USE_CONNBYTES="${USE_CONNBYTES:-0}"
 # 写出 nfqueue 拦截器脚本
 cat > /tmp/drbd_interceptor.py << 'PYEOF'
 #!/usr/bin/env python3
-"""
-DRBD IO 帧级拦截器（无 scapy 依赖，纯 struct 解析）
-用法: python3 drbd_interceptor.py <max_frames> <ready_file>
-  max_frames : 允许通过的真实 DRBD P_DATA 帧数量
-  ready_file : 就绪信号文件路径
 
-IP header:  version/ihl(1) tos(1) tot_len(2) id(2) frag(2) ttl(1) proto(1) cksum(2) src(4) dst(4)
-            ihl 字段低4位 × 4 = IP 头长度（通常 20 字节）
-TCP header: sport(2) dport(2) seq(4) ack(4) offset/flags(2) window(2) cksum(2) urg(2)
-            offset 字段高4位 × 4 = TCP 头长度（通常 20 字节）
-DRBD wire:  magic(4) command(2) length(2)  [8.4.x 和 9.x 共用]
-            8.4.x magic = 0x83740000
-            9.0.x magic = 0x83740002
-            P_DATA command = 0x0000
-"""
-import sys, os, signal, struct, subprocess
+import sys
+import signal
+import subprocess
+import threading
+import time
 
-MAX_FRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-READY_FILE = sys.argv[2]       if len(sys.argv) > 2 else "/tmp/interceptor_ready"
-DRBD_PORT  = 7789
+from netfilterqueue import NetfilterQueue
 
-# DRBD magic: 兼容 8.4.x 和 9.0.x
-DRBD_MAGICS   = {0x83740000, 0x83740002}
-DRBD_HDR_SIZE = 8       # magic(4) + command(2) + length(2)
-DRBD_CMD_DATA = 0x0000  # P_DATA — 真实写数据帧
+MAX_FRAMES = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+READY_FILE = sys.argv[2] if len(sys.argv) > 2 else "/tmp/interceptor_ready"
+
+DRBD_PORT = 7789
 
 pass_count = 0
 drop_count = 0
-ctrl_count = 0
-drop_mode  = False
+drop_mode = False
 
-def extract_tcp_payload(raw_ip_bytes):
-    """
-    从原始 IP 包字节中提取 TCP payload。
-    返回 bytes，解析失败返回 b''。
-    """
-    if len(raw_ip_bytes) < 20:
+
+def extract_tcp_payload(raw):
+
+    if len(raw) < 20:
         return b''
-    # IP header length = (ihl & 0x0f) * 4
-    ihl = (raw_ip_bytes[0] & 0x0f) * 4
-    proto = raw_ip_bytes[9]
-    if proto != 6:          # 只处理 TCP (proto=6)
+
+    ihl = (raw[0] & 0x0F) * 4
+
+    if raw[9] != 6:
         return b''
-    if len(raw_ip_bytes) < ihl + 20:
+
+    if len(raw) < ihl + 20:
         return b''
+
     tcp_start = ihl
-    # TCP data offset = high 4 bits of byte [12] * 4
-    tcp_doff = (raw_ip_bytes[tcp_start + 12] >> 4) * 4
-    payload_start = tcp_start + tcp_doff
-    if payload_start >= len(raw_ip_bytes):
-        return b''
-    return raw_ip_bytes[payload_start:]
+    tcp_doff = (raw[tcp_start + 12] >> 4) * 4
 
-def scan_drbd_frames(tcp_payload):
-    """
-    扫描 TCP payload 中的 DRBD 帧。
-    返回 (data_frame_count, ctrl_frame_count)。
-    一个 TCP segment 可能包含多个连续 DRBD 帧（TCP coalescing）。
-    """
-    data_frames = 0
-    ctrl_frames = 0
-    offset = 0
-    buf = tcp_payload
-    while offset + DRBD_HDR_SIZE <= len(buf):
-        try:
-            magic, cmd, length = struct.unpack_from('>IHH', buf, offset)
-        except struct.error:
-            break
-        if magic not in DRBD_MAGICS:
-            break   # 不是 DRBD 帧，停止扫描
-        if cmd == DRBD_CMD_DATA and length > 0:
-            data_frames += 1
-        else:
-            ctrl_frames += 1
-        # 前进到下一帧
-        offset += DRBD_HDR_SIZE + length
-    return data_frames, ctrl_frames
+    payload_start = tcp_start + tcp_doff
+
+    if payload_start >= len(raw):
+        return b''
+
+    return raw[payload_start:]
+
 
 def cleanup(sig=None, frame=None):
-    subprocess.run(['iptables', '-D', 'OUTPUT', '-p', 'tcp',
-                    '--dport', str(DRBD_PORT), '-j', 'NFQUEUE',
-                    '--queue-num', '0'], capture_output=True)
-    print(f"[interceptor] 退出: data_passed={pass_count} "
-          f"data_dropped={drop_count} ctrl_passthrough={ctrl_count}", flush=True)
+
+    subprocess.run([
+        "iptables", "-D", "OUTPUT",
+        "-p", "tcp",
+        "--dport", str(DRBD_PORT),
+        "-j", "NFQUEUE",
+        "--queue-num", "0"
+    ], capture_output=True)
+
+    print(
+        f"[interceptor] exit: passed={pass_count} dropped={drop_count}",
+        flush=True
+    )
+
     sys.exit(0)
 
+
 signal.signal(signal.SIGTERM, cleanup)
-signal.signal(signal.SIGINT,  cleanup)
+signal.signal(signal.SIGINT, cleanup)
 
-try:
-    from netfilterqueue import NetfilterQueue
 
-    def process(pkt):
-        global pass_count, drop_count, ctrl_count, drop_mode
-        raw = pkt.get_payload()
+def process(pkt):
 
-        tcp_payload = extract_tcp_payload(raw)
-        if len(tcp_payload) < DRBD_HDR_SIZE:
-            pkt.accept()
-            return
+    global pass_count, drop_count, drop_mode
 
-        data_cnt, ctrl_cnt = scan_drbd_frames(tcp_payload)
+    raw = pkt.get_payload()
+    payload = extract_tcp_payload(raw)
 
-        if data_cnt == 0 and ctrl_cnt == 0:
-            # 非 DRBD 流量，直接放行
-            pkt.accept()
-            return
-
-        if data_cnt == 0:
-            # 只含控制/心跳帧，无条件放行
-            ctrl_count += ctrl_cnt
-            pkt.accept()
-            return
-
-        # 含真实数据帧
-        if drop_mode:
-            drop_count += data_cnt
-            print(f"[interceptor] DROP data_frames={data_cnt} "
-                  f"total_drop={drop_count} tcp_payload={len(tcp_payload)}B", flush=True)
-            pkt.drop()
-            return
-
-        pass_count += data_cnt
-        print(f"[interceptor] PASS data_frames={data_cnt} "
-              f"total_pass={pass_count}/{MAX_FRAMES} tcp_payload={len(tcp_payload)}B", flush=True)
-        if pass_count >= MAX_FRAMES:
-            drop_mode = True
-            print(f"[interceptor] *** 已通过 {pass_count} 个数据帧，"
-                  f"切换 DROP 模式（控制/心跳仍放行）***", flush=True)
+    if len(payload) == 0:
         pkt.accept()
+        return
 
-    subprocess.run(['iptables', '-I', 'OUTPUT', '-p', 'tcp',
-                    '--dport', str(DRBD_PORT), '-j', 'NFQUEUE',
-                    '--queue-num', '0'], check=False)
+    if drop_mode:
 
-    nfq = NetfilterQueue()
-    nfq.bind(0, process)
+        drop_count += 1
 
-    # ── 关键时序修复 ──────────────────────────────────────────────────
-    # nfq.run() 是阻塞事件循环。必须先让它进入监听状态，
-    # 再写 READY_FILE 通知主脚本开始 MySQL 事务。
-    # 否则：主脚本收到信号 → MySQL 提交 → DRBD IO → NFQUEUE 里的包
-    #        无消费者 → 内核超时丢弃 → process() 永远不被调用。
-    # 解决：在子线程里启动 run()，主线程等事件循环就绪后再写 READY_FILE。
-    import threading, time as _time
-    _loop_ready = threading.Event()
+        print(
+            f"[DROP] packet {drop_count}",
+            flush=True
+        )
 
-    def _run_nfq():
-        _loop_ready.set()   # run() 即将被调用，通知主线程
-        nfq.run()
+        pkt.drop()
+        return
 
-    _t = threading.Thread(target=_run_nfq, daemon=True)
-    _t.start()
-    _loop_ready.wait(timeout=3)
-    _time.sleep(0.2)        # 额外等待 200ms，确保内核 nfqueue socket 就绪
+    pass_count += 1
 
-    print(f"[interceptor] nfqueue 模式启动，最多允许 {MAX_FRAMES} 个 P_DATA 帧通过",
-          flush=True)
-    open(READY_FILE, 'w').write('ready')
+    print(
+        f"[PASS] packet {pass_count}/{MAX_FRAMES}",
+        flush=True
+    )
 
-    _t.join()   # 等待事件循环退出（由 SIGTERM → cleanup → sys.exit() 终止）
+    if pass_count >= MAX_FRAMES:
 
-except ImportError:
-    # nfqueue 不可用，降级到 connbytes → 纯 DROP
-    ALLOW_BYTES = MAX_FRAMES * 16384
-    result = subprocess.run([
-        'iptables', '-A', 'OUTPUT', '-p', 'tcp',
-        '-d', '192.168.171.131', '--dport', str(DRBD_PORT),
-        '-m', 'connbytes',
-        '--connbytes', f'{ALLOW_BYTES}:',
-        '--connbytes-dir', 'original',
-        '--connbytes-mode', 'bytes',
-        '-j', 'DROP'
-    ], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"[interceptor] connbytes 不可用: {result.stderr.strip()}", flush=True)
-        print(f"[interceptor] 降级为纯 DROP（立即切断所有 DRBD OUTPUT）", flush=True)
-        subprocess.run([
-            'iptables', '-A', 'OUTPUT', '-p', 'tcp',
-            '-d', '192.168.171.131', '--dport', str(DRBD_PORT),
-            '-j', 'DROP'
-        ], capture_output=True)
-    else:
-        print(f"[interceptor] connbytes 模式: 允许前 {ALLOW_BYTES} 字节后 DROP", flush=True)
-    open(READY_FILE, 'w').write('ready')
-    import time
-    while True:
-        time.sleep(1)
+        drop_mode = True
+
+        print(
+            f"[interceptor] *** START DROP MODE ***",
+            flush=True
+        )
+
+    pkt.accept()
+
+
+subprocess.run([
+    "iptables", "-I", "OUTPUT",
+    "-p", "tcp",
+    "--dport", str(DRBD_PORT),
+    "-j", "NFQUEUE",
+    "--queue-num", "0"
+], check=False)
+
+
+nfq = NetfilterQueue()
+nfq.bind(0, process)
+
+ready = threading.Event()
+
+
+def run_loop():
+    ready.set()
+    nfq.run()
+
+
+t = threading.Thread(target=run_loop, daemon=True)
+t.start()
+
+ready.wait()
+
+time.sleep(0.2)
+
+print(
+    f"[interceptor] started, allow {MAX_FRAMES} packets",
+    flush=True
+)
+
+open(READY_FILE, "w").write("ready")
+
+t.join()
 PYEOF
 
 READY_FILE="/tmp/interceptor_ready"
 INTERCEPTOR_LOG="/tmp/interceptor.log"
 rm -f "$READY_FILE"
 
-info "启动 IO 拦截器（允许 2 个 DRBD 数据帧通过后切断）..."
-python3 /tmp/drbd_interceptor.py 2 "$READY_FILE" \
+info "启动 IO 拦截器（允许 1 个 DRBD 数据帧通过后切断）..."
+python3 /tmp/drbd_interceptor.py 1 "$READY_FILE" \
         > "$INTERCEPTOR_LOG" 2>&1 &
 INTERCEPT_PID=$!
 echo "$INTERCEPT_PID" > /tmp/interceptor.pid
@@ -505,6 +459,7 @@ if [ ! -f "$READY_FILE" ]; then
     FALLBACK_MODE=1
 else
     info "✓ 拦截器已就绪 (PID=${INTERCEPT_PID})"
+    sleep 3 
     FALLBACK_MODE=0
 fi
 
@@ -545,17 +500,20 @@ fi
 
 log "【MySQL 事务开始】$(date '+%H:%M:%S.%6N')"
 
-mysql_cmd drbd_test -e "
-START TRANSACTION;
-INSERT INTO iops_trace (val) VALUES
-    ('ROW_A_drbd_partial_io_test_data_payload_aaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
-    ('ROW_B_drbd_partial_io_test_data_payload_bbbbbbbbbbbbbbbbbbbbbbbbbbbb'),
-    ('ROW_C_drbd_partial_io_test_data_payload_cccccccccccccccccccccccccccc');
-UPDATE iops_trace SET val = CONCAT(val, '_UPDATED') WHERE id <= 3;
-COMMIT;" 2>/dev/null || warn "事务执行失败或部分完成（IO拦截导致，属预期现象）"
+set +e
+for i in $(seq 1 500); do
+    mysql_cmd drbd_test -e "
+    INSERT INTO iops_trace(val) VALUES(REPEAT('A',4096));
+    UPDATE iops_trace SET val = CONCAT(val, '_UPDATED') WHERE id = LAST_INSERT_ID();
+    COMMIT;
+    " 2>/dev/null || warn "事务 $i 失败（可能因 IO 拦截，属预期）"
+done
 
 MYSQL_EXIT=$?
-log "【MySQL 事务结束】$(date '+%H:%M:%S.%6N') exit=${MYSQL_EXIT}"
+set -e
+if [ $MYSQL_EXIT -ne 0 ]; then
+    warn "MySQL 事务执行失败 exit=${MYSQL_EXIT}"
+fi
 
 mysql_cmd drbd_test -e \
     "SELECT id, val, ts FROM iops_trace ORDER BY id;" \
@@ -569,7 +527,9 @@ mysql_cmd -e "SHOW MASTER STATUS\G" \
     > "${RESULT_DIR}/mysql_binlog_pos.txt" 2>/dev/null || true
 
 info "主节点提交后数据："
-cat "${RESULT_DIR}/mysql_primary_after_commit.txt" | tee -a "$LOG"
+# cat "${RESULT_DIR}/mysql_primary_after_commit.txt" | tee -a "$LOG"
+AFTER_ROW_COUNT=$(wc -l < "${RESULT_DIR}/mysql_primary_after_commit.txt" 2>/dev/null || echo "0")
+info "主节点提交后 iops_trace 表行数: ${AFTER_ROW_COUNT}"
 
 fi # TEST_MYSQL
 
@@ -591,21 +551,28 @@ done | tee -a "$LOG"
 
 # 解析并记录 meta.dat（写入前）
 python3 << PYEOF | tee "${RESULT_DIR}/nsq_meta_before.txt" | tee -a "$LOG"
-import struct, glob
+import glob
+
 files = glob.glob('${NSQ_DATA_DIR}/**/*.meta.dat', recursive=True)
 if not files:
     print("  未找到 meta.dat 文件")
 for f in files:
     print(f"\n  文件: {f}")
     try:
-        data = open(f, 'rb').read()
-        if len(data) >= 24:
-            r, w, d = struct.unpack('>qqq', data[:24])
-            print(f"    readPos  = {r}")
-            print(f"    writePos = {w}")
-            print(f"    depth    = {d}")
+        with open(f, 'r') as fp:
+            lines = [line.strip() for line in fp.readlines()]
+        if len(lines) >= 3:
+            version = lines[0]
+            read_pos, write_pos = map(int, lines[1].split(','))
+            next_read_file, next_write_file = map(int, lines[2].split(','))
+            print(f"    version         = {version}")
+            print(f"    readPos         = {read_pos}")
+            print(f"    writePos        = {write_pos}")
+            print(f"    nextReadFileNum = {next_read_file}")
+            print(f"    nextWriteFileNum= {next_write_file}")
+            # 注意："depth" 并不直接存储在 meta 中，而是通过 (writePos - readPos) + 文件数量估算
         else:
-            print(f"    文件大小 {len(data)} bytes, 内容: {data.hex()}")
+            print(f"    文件行数不足，内容: {lines}")
     except Exception as e:
         print(f"    读取失败: {e}")
 PYEOF
@@ -614,15 +581,18 @@ NSQ_MSG="DRBD_TEST_MSG_$(date +%s%N)_partial_io_experiment_payload"
 log "发送 NSQ 消息: ${NSQ_MSG}"
 
 log "【NSQ 消息发送开始】$(date '+%H:%M:%S.%6N')"
-NSQ_HTTP_RESP=$(curl -s --max-time 10 -w "\n%{http_code}" \
-                  -d "${NSQ_MSG}" \
-                  "${NSQ_HTTP}/pub?topic=${TOPIC}" 2>/dev/null || echo -e "\n000")
-NSQ_HTTP_CODE=$(echo "$NSQ_HTTP_RESP" | tail -1)
-log "【NSQ 消息发送结束】$(date '+%H:%M:%S.%6N') HTTP=${NSQ_HTTP_CODE}"
+# 发送500个 HTTP POST 请求写入 NSQ，设置超时并捕获 HTTP 状态码
+for i in $(seq 1 500); do
+    NSQ_HTTP_RESP=$(curl -s --max-time 10 -w "\n%{http_code}" \
+                      -d "${NSQ_MSG}_${i}" \
+                      "${NSQ_HTTP}/pub?topic=${TOPIC}" 2>/dev/null || echo -e "\n000")
+    NSQ_HTTP_CODE=$(echo "$NSQ_HTTP_RESP" | tail -1)
+    if [ "$NSQ_HTTP_CODE" != "200" ]; then
+        warn "第 ${i} 条消息发送失败 HTTP=${NSQ_HTTP_CODE}"
+    fi
+done
 
-if [ "$NSQ_HTTP_CODE" != "200" ]; then
-    warn "NSQ 发送返回 HTTP=${NSQ_HTTP_CODE}，nsqd 可能未就绪或写入失败"
-fi
+log "【NSQ 消息发送结束】$(date '+%H:%M:%S.%6N')"
 
 # 等待 nsqd fsync 落盘
 sleep 2
@@ -634,22 +604,28 @@ sleep 1
 
 # 记录写入后 meta.dat
 python3 << PYEOF | tee "${RESULT_DIR}/nsq_meta_after_primary.txt" | tee -a "$LOG"
-import struct, glob
+import glob
+
 files = glob.glob('${NSQ_DATA_DIR}/**/*.meta.dat', recursive=True)
 if not files:
-    print("  未找到 meta.dat 文件（主节点）")
+    print("  未找到 meta.dat 文件")
 for f in files:
     print(f"\n  文件: {f}")
     try:
-        data = open(f, 'rb').read()
-        if len(data) >= 24:
-            r, w, d = struct.unpack('>qqq', data[:24])
-            print(f"    readPos  = {r}")
-            print(f"    writePos = {w}")
-            print(f"    depth    = {d}")
-            print(f"    未读消息字节数 = {w - r}")
+        with open(f, 'r') as fp:
+            lines = [line.strip() for line in fp.readlines()]
+        if len(lines) >= 3:
+            count = lines[0]
+            read_pos, write_pos = map(int, lines[1].split(','))
+            next_read_file, next_write_file = map(int, lines[2].split(','))
+            print(f"    count         = {count}")
+            print(f"    readPos         = {read_pos}")
+            print(f"    writePos        = {write_pos}")
+            print(f"    nextReadFileNum = {next_read_file}")
+            print(f"    nextWriteFileNum= {next_write_file}")
+            # 注意："depth" 并不直接存储在 meta 中，而是通过 (writePos - readPos) + 文件数量估算
         else:
-            print(f"    文件大小 {len(data)} bytes, 内容: {data.hex()}")
+            print(f"    文件行数不足，内容: {lines}")
     except Exception as e:
         print(f"    读取失败: {e}")
 PYEOF
@@ -674,10 +650,9 @@ section "阶段6：模拟主节点故障"
 sleep 1
 
 # 统计拦截帧数（匹配新日志格式 "PASS data_frame" / "DROP data_frame"）
-PASSED=$(grep -c "PASS data_frame"  "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
-DROPPED=$(grep -c "DROP data_frame" "$INTERCEPTOR_LOG" 2>/dev/null || echo "0")
-PASSED=$(echo "$PASSED"  | tr -d '[:space:]')
-DROPPED=$(echo "$DROPPED" | tr -d '[:space:]')
+PASSED=$(grep -c "\[PASS\]" $INTERCEPTOR_LOG 2>/dev/null || echo 0)
+DROPPED=$(grep -c "\[DROP\]" $INTERCEPTOR_LOG 2>/dev/null || echo 0)
+echo "[INFO] 拦截统计：真实数据帧已通过 $PASSED 个，已丢弃 $DROPPED 个（心跳/控制包不计入）"
 info "拦截统计：真实数据帧已通过 ${PASSED} 个，已丢弃 ${DROPPED} 个（心跳/控制包不计入）"
 cat "$INTERCEPTOR_LOG" 2>/dev/null | tee -a "$LOG" || true
 
@@ -701,6 +676,9 @@ info "① 停止应用服务（释放文件系统 IO）..."
 systemctl is-active mysqld --quiet 2>/dev/null && systemctl stop mysqld 2>/dev/null || true
 systemctl is-active nsqd   --quiet 2>/dev/null && systemctl stop nsqd   2>/dev/null || true
 sleep 1
+
+drbdadm disconnect ${DRBD_RES} 2>/dev/null | tee -a "$LOG"
+# exit 0
 
 info "② 卸载 DRBD 文件系统（释放 /dev/drbd1 块设备占用）..."
 sync
